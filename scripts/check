@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# Terse project check. One line on success; a capped,
+# actionable summary on failure. Full Gradle output: build/check.log.
+#
+#   scripts/check               format + detekt + core tests + invariants + adversary tests
+#   scripts/check test <glob>   one test class/method, e.g. '*StyleEngine*'
+#   scripts/check fix           auto-format (spotlessApply), then re-check format
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+mkdir -p build
+LOG="build/check.log"
+MAX_LINES=20
+start=$(date +%s)
+
+# App sources get a local compile + detekt check when an android.jar is available
+# (tools/appcheck): $ANDROID_JAR, a cached copy, or a local SDK.
+ANDROID_JAR="${ANDROID_JAR:-}"
+for candidate in "$HOME/.cache/chamboard/android-35.jar" "${ANDROID_HOME:-/opt/android-sdk}/platforms/android-35/android.jar"; do
+    [ -z "$ANDROID_JAR" ] && [ -f "$candidate" ] && ANDROID_JAR="$candidate"
+done
+APPCHECK_ARGS=()
+APPCHECK_TASKS=()
+if [ -n "$ANDROID_JAR" ] && [ -d app/src/main/kotlin ]; then
+    APPCHECK_ARGS=("-PandroidJar=$ANDROID_JAR")
+    APPCHECK_TASKS=(:appcheck:compileKotlin :appcheck:detekt)
+fi
+
+gradle() {
+    # Maven Central / the plugin portal sometimes answer 429; retry network failures only.
+    local attempt
+    for attempt in 1 2 3; do
+        if ./gradlew -PcoreOnly=true "${APPCHECK_ARGS[@]}" --console=plain --continue "$@" >"$LOG" 2>&1; then
+            return 0
+        fi
+        grep -qE "status code 429|Could not (download|get resource|resolve)" "$LOG" || return 1
+        sleep $((attempt * 8))
+    done
+    return 1
+}
+
+summarise_failure() {
+    python3 - "$ROOT" "$MAX_LINES" <<'PY'
+import glob, os, re, sys
+root, cap = sys.argv[1], int(sys.argv[2])
+log = open(os.path.join(root, "build/check.log"), encoding="utf-8", errors="ignore").read()
+out = []
+
+# Kotlin compile errors: "e: file:///abs/path.kt:12:5 message"
+for m in re.finditer(r"^e: (?:file://)?(\S+?):(\d+):\d+ (.*)$", log, re.M):
+    out.append(f"compile  {os.path.relpath(m.group(1), root)}:{m.group(2)} {m.group(3)}")
+
+# Spotless: list files with violations.
+for block in re.findall(r"The following files had format violations:\n((?:\s{6}\S.*\n)+)", log):
+    for f in re.findall(r"^\s{6}(\S+)$", block, re.M):
+        out.append(f"format   {f}  (fix: scripts/check fix)")
+
+# detekt plain-text report: "Rule - [msg] at /abs/file.kt:12:5 - Signature=..."
+for rep in glob.glob(os.path.join(root, "**/build/reports/detekt/detekt.txt"), recursive=True):
+    for line in open(rep, encoding="utf-8"):
+        m = re.match(r"(\w+) - (?:\d+/\d+ - )?\[(.*?)\] at (\S+?):(\d+):\d+", line)
+        if m:
+            out.append(f"detekt   {os.path.relpath(m.group(3), root)}:{m.group(4)} {m.group(1)}: {m.group(2)}")
+
+# JUnit failures.
+for xml in glob.glob(os.path.join(root, "**/build/test-results/test/*.xml"), recursive=True):
+    text = open(xml, encoding="utf-8").read()
+    for m in re.finditer(r'<testcase name="([^"]+)" classname="([^"]+)"[^>]*>\s*<failure message="([^"]*)"', text):
+        msg = m.group(3).replace("&#10;", " ").replace("&quot;", '"').replace("&lt;", "<").replace("&gt;", ">")
+        out.append(f"test     {m.group(2).rsplit('.', 1)[-1]}.{m.group(1)}: {msg[:160]}")
+
+# Invariant task failures and anything else Gradle explains.
+if not out:
+    for m in re.finditer(r"\* What went wrong:\n(.*?)(?:\n\* Try:|\Z)", log, re.S):
+        out.extend(l.strip() for l in m.group(1).strip().splitlines()[:6])
+
+seen = []
+for line in out:
+    if line not in seen:
+        seen.append(line)
+for line in seen[:cap]:
+    print(line)
+if len(seen) > cap:
+    print(f"... {len(seen) - cap} more")
+PY
+    echo "full log: $LOG"
+}
+
+count_tests() {
+    python3 - "$ROOT" <<'PY'
+import glob, os, re, sys
+n = 0
+for xml in glob.glob(os.path.join(sys.argv[1], "**/build/test-results/test/*.xml"), recursive=True):
+    m = re.search(r'<testsuite [^>]*tests="(\d+)"', open(xml, encoding="utf-8").read())
+    n += int(m.group(1)) if m else 0
+print(n)
+PY
+}
+
+# Adversarial page tests: plain `node --test`, skipped when Node isn't installed.
+adversary_check() {
+    [ -d adversary ] && command -v node >/dev/null || return 0
+    local out
+    if ! out=$(node --test 'adversary/**/*.test.js' 2>&1); then
+        echo "$out" | grep -E '^not ok|^# (fail|Subtest)|AssertionError|Error:' | head -n "$MAX_LINES" | sed 's/^/adversary /'
+        return 1
+    fi
+    echo "$(echo "$out" | sed -n 's/^# pass //p') adversary tests"
+}
+
+# Content hash of every modified or untracked file, to tell whether a step changed anything.
+tree_state() { git ls-files -m -o --exclude-standard -z | xargs -0 -r md5sum 2>/dev/null | md5sum; }
+
+elapsed() { echo "$(( $(date +%s) - start ))s"; }
+
+case "${1:-all}" in
+    all)
+        ok=0
+        gradle spotlessCheck :core:check "${APPCHECK_TASKS[@]}" || ok=1
+        [ $ok -eq 0 ] || { echo "✗ check failed"; summarise_failure; }
+        adv_note=""
+        if adv_out=$(adversary_check); then
+            [ -n "$adv_out" ] && adv_note=", $adv_out"
+        else
+            ok=1; echo "$adv_out"
+        fi
+        app_note=""
+        [ ${#APPCHECK_TASKS[@]} -gt 0 ] && app_note=", app compile"
+        [ $ok -eq 0 ] && echo "✓ check: format, detekt, $(count_tests) tests, invariants$adv_note$app_note ($(elapsed))"
+        exit $ok
+        ;;
+    test)
+        [ -n "${2:-}" ] || { echo "usage: scripts/check test '<pattern>'"; exit 2; }
+        if gradle :core:test --tests "$2"; then
+            echo "✓ tests matching $2 ($(elapsed))"
+        else
+            echo "✗ tests matching $2"; summarise_failure; exit 1
+        fi
+        ;;
+    fix)
+        before=$(tree_state)
+        if gradle spotlessApply && gradle spotlessCheck; then
+            [ "$before" = "$(tree_state)" ] && echo "✓ already formatted" || echo "✓ formatted (see git diff)"
+        else
+            echo "✗ formatting could not be fully applied"; summarise_failure; exit 1
+        fi
+        ;;
+    *)
+        sed -n '2,8p' "$0"; exit 2
+        ;;
+esac

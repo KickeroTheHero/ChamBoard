@@ -1,0 +1,44 @@
+# Overrides on top of detekt's default config (buildUponDefaultConfig = true).
+# Every override needs a reason; keep this file short.
+
+config:
+  validation: true
+
+build:
+  maxIssues: 0
+
+style:
+  MagicNumber:
+    # Tests are full of literal expectations; timing and lexicon tables are
+    # named constants at file level, which detekt already allows.
+    excludes: ['**/test/**']
+    ignorePropertyDeclaration: true
+    ignoreCompanionObjectPropertyDeclaration: true
+  MaxLineLength:
+    maxLineLength: 120
+    excludes: ['**/test/**']
+  ReturnCount:
+    # Early-return guard clauses are idiomatic Kotlin and keep rules readable.
+    max: 3
+    excludeGuardClauses: true
+  WildcardImport:
+    active: true
+    excludeImports: []
+
+complexity:
+  LongMethod:
+    excludes: ['**/test/**']
+  LargeClass:
+    excludes: ['**/test/**']
+  # Lexicon files are long by nature (spelling maps, synonym sets).
+  TooManyFunctions:
+    excludes: ['**/test/**', '**/style/lexicon/**']
+    # Android framework callbacks (View, InputMethodService) are overrides we
+    # don't choose; count only our own functions.
+    ignoreOverridden: true
+
+naming:
+  FunctionNaming:
+    # Allow `behaviourDescribed` style test names without backticks; default
+    # pattern already allows camelCase, this keeps test helpers unrestricted.
+    excludes: ['**/test/**']

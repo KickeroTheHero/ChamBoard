@@ -1,0 +1,134 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    name: core (engine tests + invariants)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v5
+      - name: Format, detekt, tests, invariants
+        run: ./gradlew -PcoreOnly=true spotlessCheck :core:check --continue --console=plain
+      - name: Adversarial page tests
+        run: node --test 'adversary/**/*.test.js'
+      - name: Upload reports
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: core-reports
+          path: |
+            core/build/reports/tests/
+            core/build/reports/detekt/
+
+  app:
+    name: app (APK + no-permissions check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Detect app module
+        id: detect
+        run: |
+          if [ -f app/build.gradle.kts ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "present=false" >> "$GITHUB_OUTPUT"; echo "::notice::app module not created yet; skipping APK build"; fi
+      - name: INV-3 — no logging; clipboard only in ClipboardBridge
+        if: steps.detect.outputs.present == 'true'
+        run: |
+          if grep -rnE 'android\.util\.Log|\bLog\.[vdiwe]\(' app/src/main; then
+            echo "::error::INV-3 violated: app must not log"; exit 1
+          fi
+          if grep -rln 'ClipboardManager' app/src/main | grep -v 'ClipboardBridge\.kt$'; then
+            echo "::error::INV-3: ClipboardManager only allowed in ClipboardBridge.kt"; exit 1
+          fi
+      - uses: actions/setup-java@v5
+        if: steps.detect.outputs.present == 'true'
+        with:
+          distribution: temurin
+          java-version: 17
+      # GitHub's Ubuntu runners ship the Android SDK (ANDROID_HOME); AGP fetches
+      # any missing platform/build-tools itself. setup-android@v3 broke on the
+      # removed "tools" package, so it isn't used.
+      - uses: gradle/actions/setup-gradle@v5
+        if: steps.detect.outputs.present == 'true'
+      - name: Build debug APK, Android Lint, verify manifest
+        if: steps.detect.outputs.present == 'true'
+        run: ./gradlew :app:assembleDebug :app:lintDebug :app:testDebugUnitTest :app:verifyNoPermissions --continue --console=plain
+      - name: Upload lint report
+        if: failure() && steps.detect.outputs.present == 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          name: app-lint-report
+          path: app/build/reports/lint-results-debug.*
+      - name: Upload debug APK
+        if: steps.detect.outputs.present == 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          name: chamboard-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+
+  screenshots:
+    name: screenshots (emulator)
+    needs: app
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write # publish PNGs to the ci-screenshots branch
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v5
+      - name: Build app and screenshot runner
+        run: ./gradlew :app:assembleDebug :app:assembleDebugAndroidTest --console=plain
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Render screens on an emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          profile: pixel_6 # phone resolution and density (1080x2400, 420 dpi)
+          disable-animations: true
+          script: |
+            adb install -r app/build/outputs/apk/debug/app-debug.apk
+            adb install -r app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+            adb shell am instrument -w dev.chamboard.test/dev.chamboard.ime.ScreenshotInstrumentation | tee instrument.log
+            grep -q "INSTRUMENTATION_CODE: -1" instrument.log
+            mkdir -p screenshots
+            adb pull /sdcard/Android/data/dev.chamboard/files/screenshots/. screenshots/
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: screenshots
+          path: screenshots/
+      # The latest screenshots are also force-pushed to an orphan branch, so they can be
+      # fetched with git or linked from the README.
+      - name: Publish to ci-screenshots branch
+        if: github.event_name == 'push' && hashFiles('screenshots/*.png') != ''
+        run: |
+          cd screenshots
+          git init -q -b ci-screenshots
+          git config user.name "ci-screenshots"
+          git config user.email "ci-screenshots@users.noreply.github.com"
+          echo "Screenshots from ${GITHUB_SHA} (${GITHUB_REF_NAME})" > README.md
+          git add -A
+          git commit -qm "Screenshots for ${GITHUB_SHA}"
+          git push -qf "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" ci-screenshots

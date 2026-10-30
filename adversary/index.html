@@ -1,0 +1,59 @@
+<!doctype html>
+<!--
+  Adversarial test page (see docs/design/testing.md). It acts like a website that watches
+  how you type. Open it from disk or on localhost; it makes no network requests, and a
+  recording only leaves the page if you press "Download JSON".
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src 'self' blob:; connect-src 'none'" />
+    <title>ChamBoard adversary</title>
+    <style>
+      :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+      body { margin: 0 auto; max-width: 720px; padding: 16px; }
+      textarea, input[type="text"] { box-sizing: border-box; width: 100%; font: inherit; }
+      textarea { min-height: 7em; }
+      .row { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
+      .note { font-size: 0.9em; opacity: 0.8; }
+      table { border-collapse: collapse; font-size: 0.85em; width: 100%; }
+      th, td { border-bottom: 1px solid #8884; padding: 2px 6px; text-align: left; white-space: nowrap; }
+      .scroll { max-height: 18em; overflow: auto; }
+      dl { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; }
+      dt { font-weight: 600; }
+    </style>
+  </head>
+  <body>
+    <h1>Adversary: event recorder</h1>
+    <p class="note">
+      Type into the box as you normally would. Everything a tracking script could see is recorded
+      here, on this device only. Don't type anything private.
+    </p>
+    <label for="label">Session label</label>
+    <input id="label" type="text" placeholder="e.g. with ChamBoard, Draft Guard" />
+    <p></p>
+    <label for="field">Type here</label>
+    <textarea id="field" autocomplete="off"></textarea>
+    <div class="row">
+      <button id="download" type="button">Download JSON</button>
+      <button id="clear" type="button">Clear</button>
+    </div>
+    <h2>Summary</h2>
+    <dl id="summary"></dl>
+    <p><strong>Human or ChamBoard?</strong> <span id="verdict"></span></p>
+    <ul id="reasons" class="note"></ul>
+    <h2>Events</h2>
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr><th>t (ms)</th><th>type</th><th>key / inputType</th><th>keyCode</th><th>data</th><th>box length</th></tr>
+        </thead>
+        <tbody id="events"></tbody>
+      </table>
+    </div>
+    <script src="recorder.js"></script>
+    <script src="matchers/classifier.js"></script>
+    <script src="page.js"></script>
+  </body>
+</html>
